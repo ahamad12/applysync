@@ -9,41 +9,43 @@ from pathlib import Path
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Initialize S3 client
+# Initialize AWS clients
 s3_client = boto3.client('s3')
+textract_client = boto3.client('textract')
 
-# PDF Extraction Functions
-def extract_from_pdf(file_path):
-    """Extract text from PDF file with content debug logging"""
+# Text Extraction Functions
+def extract_from_pdf_with_textract(file_path):
+    """Extract text from PDF using Amazon Textract"""
     try:
-        import PyPDF2
-        text = ""
+        logger.info("Extracting text from PDF using Amazon Textract")
+        
+        # Read the file as bytes
         with open(file_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            num_pages = len(reader.pages)
-            logger.info(f"PDF has {num_pages} pages")
-            
-            for page_num in range(num_pages):
-                page = reader.pages[page_num]
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-                else:
-                    logger.warning(f"Page {page_num} returned no text")
-        
-        logger.info(f"Extracted PDF text length: {len(text)} characters")
+            file_bytes = file.read()
+
+        # Call Textract to extract text
+        response = textract_client.detect_document_text(
+            Document={'Bytes': file_bytes}
+        )
+
+        # Extract text from Textract response
+        text = ""
+        for block in response['Blocks']:
+            if block['BlockType'] == 'LINE':
+                text += block['Text'] + "\n"
+
+        logger.info(f"Extracted text length: {len(text)} characters")
         logger.info(f"Extracted text sample: {text[:300]}...")
-        
+
         # Clean up text
         text = clean_text(text)
         return text
     except Exception as e:
-        logger.error(f"Error extracting PDF: {str(e)}")
+        logger.error(f"Error extracting PDF with Textract: {str(e)}")
         raise
 
-# DOCX Extraction Functions
 def extract_from_docx(file_path):
-    """Extract text from DOCX file with content debug logging"""
+    """Extract text from DOCX file using python-docx"""
     try:
         from docx import Document
         document = Document(file_path)
@@ -82,11 +84,10 @@ def clean_text(text):
     text = re.sub(r'\.\s+', '.\n', text)
     return text.strip()
 
-# Improved Text Processing Functions
+# Section Extraction Functions (unchanged)
 def extract_sections(text):
-    """Extract different sections from CV text using a more flexible approach"""
+    """Extract different sections from CV text"""
     try:
-        # Initialize result structure
         result = {
             "education": [],
             "qualifications": [],
@@ -97,22 +98,14 @@ def extract_sections(text):
         # Extract personal information
         result["personal_info"] = extract_personal_info(text)
         
-        logger.info("Extracting sections using whole-text analysis approach")
-        
-        # Extract education with simple text analysis
+        # Extract education, skills, and experience
         result["education"] = extract_education_info(text)
-        
-        # Extract skills with simple text analysis
         result["qualifications"] = extract_skills_info(text)
-        
-        # Extract experience with simple text analysis
         result["projects"] = extract_experience_info(text)
         
         return result
     except Exception as e:
         logger.error(f"Error extracting sections: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
         return {
             "education": [],
             "qualifications": [],
@@ -120,13 +113,13 @@ def extract_sections(text):
             "personal_info": {}
         }
 
+# Personal Info Extraction (unchanged)
 def extract_personal_info(text):
-    """Extract personal information using more flexible patterns"""
+    """Extract personal information using regex patterns"""
     personal_info = {}
     
-    # Extract name with improved patterns
+    # Extract name
     name_patterns = [
-        # First try to capture full ALL CAPS name at beginning
         r'^([A-Z][A-Z\s]+(?:[A-Z][a-z]+\s)*[A-Z][a-z]+)',  # FIRST LAST or FIRST MIDDLE LAST
         r'^([A-Z][a-z]+\s+[A-Z][a-z]+)',  # First Last at start
         r'\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b',  # First Last anywhere 
@@ -137,13 +130,11 @@ def extract_personal_info(text):
         name_match = re.search(pattern, text)
         if name_match:
             potential_name = name_match.group(1).strip()
-            # Check if it contains address words
             if not re.search(r'\b(road|street|avenue|lane|drive|blvd)\b', potential_name, re.IGNORECASE):
                 personal_info["name"] = potential_name
                 break
     
-    
-    # Try to extract email (more flexible)
+    # Extract email
     email_patterns = [
         r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
         r'email:?\s*([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,})',
@@ -153,38 +144,25 @@ def extract_personal_info(text):
     for pattern in email_patterns:
         email_match = re.search(pattern, text, re.IGNORECASE)
         if email_match:
-            # Check if the pattern has a capture group
-            if '(' in pattern:
-                personal_info["email"] = email_match.group(1)
-            else:
-                personal_info["email"] = email_match.group(0)
+            personal_info["email"] = email_match.group(1) if '(' in pattern else email_match.group(0)
             break
     
-    # Try to extract phone (more formats) - FIXED THIS SECTION
+    # Extract phone
     phone_patterns = [
-        r'\b(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',  # No capture group
-        r'\b\d{2,3}[-.\s]?\d{7,10}\b',  # No capture group
-        r'phone:?\s*(\+?[\d\s\-\(\)\.]+)',  # Has capture group
-        r'tel:?\s*(\+?[\d\s\-\(\)\.]+)',    # Has capture group
-        r'mobile:?\s*(\+?[\d\s\-\(\)\.]+)'  # Has capture group
+        r'\b(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
+        r'\b\d{2,3}[-.\s]?\d{7,10}\b',
+        r'phone:?\s*(\+?[\d\s\-\(\)\.]+)',
+        r'tel:?\s*(\+?[\d\s\-\(\)\.]+)',
+        r'mobile:?\s*(\+?[\d\s\-\(\)\.]+)'
     ]
     
     for pattern in phone_patterns:
         phone_match = re.search(pattern, text, re.IGNORECASE)
         if phone_match:
-            # Check if the pattern has a capture group
-            if '(' in pattern and ')' in pattern and not '\\(' in pattern:
-                personal_info["phone"] = phone_match.group(1).strip()
-            else:
-                personal_info["phone"] = phone_match.group(0)
+            personal_info["phone"] = phone_match.group(1).strip() if '(' in pattern and ')' in pattern and not '\\(' in pattern else phone_match.group(0)
             break
     
     return personal_info
-
-import re
-import logging
-
-logger = logging.getLogger(__name__)
 
 def extract_education_info(text):
     """Extract education information using a generalized approach without hardcoding"""
@@ -231,7 +209,7 @@ def extract_education_info(text):
             
             # Look for degree information in the vicinity of the university
             university_end = uni_match.end()
-            search_window_end = min(university_end + 200, len(education_section))
+            search_window_end = min(university_end + 200, len(education_section))  # Fixed: Define search_window_end
             search_window = education_section[university_end:search_window_end]
             
             # Try to find degree information after the university mention
@@ -285,8 +263,8 @@ def extract_education_info(text):
             
             # Look for degree information near this university mention
             search_start = max(0, uni_match.start() - 50)  # Look a bit before too
-            search_end = min(uni_match.end() + 200, len(text))
-            search_window = text[search_start:search_end]
+            search_window_end = min(uni_match.end() + 200, len(text))  # Fixed: Define search_window_end
+            search_window = text[search_start:search_window_end]
             
             degree_match = re.search(r'((?:BSc|B\.Sc|MSc|M\.Sc|PhD|Ph\.D|Bachelor|Master|Diploma|B\.A\.|M\.A\.|B\.S\.|M\.S\.)[\s\w\.,&\(\)]+?(?:(?:in|of)?\s+[\w\s\.,&]+)?)', search_window, re.IGNORECASE)
             
@@ -363,7 +341,7 @@ def extract_skills_info(text):
                 # If no date pattern matches, look for bullet points or lines
                 if not certifications:
                     # Look for bullet points
-                    bullet_matches = re.findall(r'[•\-*]([^•\-*\n]+)', section_text)
+                    bullet_matches = re.findall(r'[•*-]([^•*\n]+)', section_text)
                     for match in bullet_matches:
                         match = match.strip()
                         if match and len(match) > 5 and match not in certifications:
@@ -396,7 +374,7 @@ def extract_skills_info(text):
                 logger.info(f"Found skills section with keyword '{keyword}': {section_text[:100]}...")
                 
                 # Look for bullet points in the section
-                bullet_matches = re.findall(r'[•\-*]([^•\-*\n]+)', section_text)
+                bullet_matches = re.findall(r'[•*-]([^•*\n]+)', section_text)
                 if bullet_matches:
                     for match in bullet_matches:
                         match = match.strip()
@@ -452,7 +430,7 @@ def extract_skills_info(text):
         # Remove date patterns
         cert = re.sub(r'\b\d{2}\/\d{4}\s*[–-]\s*(?:\d{2}\/\d{4}|present|Present)\b', '', cert)
         # Remove bullet points and other markers
-        cert = re.sub(r'^[\s•\-*]+', '', cert)
+        cert = re.sub(r'^[\s•*-]+', '', cert)
         cert = cert.strip()
         if cert and len(cert) > 5:
             clean_certifications.append(cert)
@@ -461,7 +439,7 @@ def extract_skills_info(text):
     clean_skills = []
     for skill in skills:
         # Remove bullet points and other markers
-        skill = re.sub(r'^[\s•\-*]+', '', skill)
+        skill = re.sub(r'^[\s•*-]+', '', skill)
         skill = skill.strip()
         if skill and len(skill) > 2:
             clean_skills.append(skill)
@@ -691,16 +669,13 @@ def lambda_handler(event, context):
         mime_type = determine_mime_type(file_extension)
         logger.info(f"Detected MIME type: {mime_type}")
         
-        # Parse CV using existing functions
-        file_type = determine_file_type(local_path, mime_type)
-        
         # Extract text based on file type
-        if file_type == 'pdf':
-            cv_text = extract_from_pdf(local_path)
-        elif file_type == 'docx':
+        if file_extension == '.pdf':
+            cv_text = extract_from_pdf_with_textract(local_path)
+        elif file_extension == '.docx':
             cv_text = extract_from_docx(local_path)
         else:
-            raise ValueError(f"Unsupported file type: {file_type}")
+            raise ValueError(f"Unsupported file type: {file_extension}")
         
         # Process the extracted text to identify sections
         cv_data = extract_sections(cv_text)
