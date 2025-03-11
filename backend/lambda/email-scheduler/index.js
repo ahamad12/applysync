@@ -1,49 +1,67 @@
 const AWS = require('aws-sdk');
 const nodemailer = require('nodemailer');
-
-// Initialize AWS services
-const ses = new AWS.SES({ region: process.env.AWS_REGION });
-const dynamoDB = new AWS.DynamoDB.DocumentClient();
-
-// Create email transporter using Amazon SES
-const transporter = nodemailer.createTransport({
-  SES: ses
-});
+const moment = require('moment-timezone');
 
 exports.handler = async (event) => {
   console.log('Received event:', JSON.stringify(event, null, 2));
   
   try {
-    const { recipientEmail, recipientName, scheduledTime } = event;
+    // Extract recipient information
+    const { recipientEmail, recipientName, timezone = 'UTC', applicationDate } = event;
     
-    // Check if it's time to send the email
+    // If applicationDate isn't provided, use current time
+    const submissionDate = applicationDate ? new Date(applicationDate) : new Date();
+    
+    // Calculate the optimal send time (next day at 10:00 AM in recipient's timezone)
+    const optimalSendTime = calculateOptimalSendTime(submissionDate, timezone);
+    
+    // Initialize fresh AWS clients
+    const dynamoDB = new AWS.DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION,
+      maxRetries: 3
+    });
+    
+    // Current time for comparison
     const now = new Date();
-    const scheduledDate = new Date(scheduledTime);
     
     // If scheduled time is in the future and this is the initial invocation, store in DynamoDB
-    if (scheduledDate > now && !event.retry) {
+    if (optimalSendTime > now && !event.retry) {
       // Store in DynamoDB for later processing
-      await storeEmailTask({
+      const taskId = await storeEmailTask(dynamoDB, {
         recipientEmail,
         recipientName,
-        scheduledTime,
+        scheduledTime: optimalSendTime.toISOString(),
+        timezone,
         status: 'scheduled',
         createdAt: now.toISOString()
       });
       
-      console.log(`Email scheduled for ${scheduledTime}, task stored in DynamoDB`);
+      console.log(`Email scheduled for ${optimalSendTime.toISOString()} (${timezone}), task stored in DynamoDB`);
       return {
         status: 'scheduled',
-        message: `Email to ${recipientEmail} scheduled for ${scheduledTime}`
+        taskId,
+        message: `Email to ${recipientEmail} scheduled for ${optimalSendTime.toISOString()}`,
+        scheduledTime: optimalSendTime.toISOString()
       };
     }
     
-    // Send the email
-    await sendFollowUpEmail(recipientEmail, recipientName);
+    // Initialize SES service
+    const ses = new AWS.SES({ 
+      region: process.env.AWS_REGION,
+      maxRetries: 3
+    });
+    
+    // Create transporter with fresh SES instance
+    const transporter = nodemailer.createTransport({
+      SES: ses
+    });
+    
+    // Send the email with retry capability
+    await sendWithRetry(() => sendFollowUpEmail(transporter, recipientEmail, recipientName));
     
     // Update status in DynamoDB if this is a retry
     if (event.taskId) {
-      await updateEmailTaskStatus(event.taskId, 'sent');
+      await updateEmailTaskStatus(dynamoDB, event.taskId, 'sent');
     }
     
     return {
@@ -56,7 +74,12 @@ exports.handler = async (event) => {
     
     // Update status in DynamoDB if this is a retry and it failed
     if (event.taskId) {
-      await updateEmailTaskStatus(event.taskId, 'failed', error.message);
+      const dynamoDB = new AWS.DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION,
+        maxRetries: 3
+      });
+      
+      await updateEmailTaskStatus(dynamoDB, event.taskId, 'failed', error.message);
     }
     
     return {
@@ -66,7 +89,50 @@ exports.handler = async (event) => {
   }
 };
 
-async function sendFollowUpEmail(email, name) {
+// Function to calculate optimal send time (next day at 10:00 AM in recipient's timezone)
+function calculateOptimalSendTime(submissionDate, timezone) {
+  // Create a moment object in the recipient's timezone
+  const submissionMoment = moment(submissionDate).tz(timezone);
+  
+  // Add one day and set time to 10:00 AM
+  const optimalMoment = submissionMoment.clone().add(1, 'days').hour(10).minute(0).second(0);
+  
+  // If it's already past 10:00 AM on the next day, push to following day
+  if (optimalMoment.isBefore(moment().tz(timezone))) {
+    optimalMoment.add(1, 'days');
+  }
+  
+  // Convert back to JavaScript Date
+  return optimalMoment.toDate();
+}
+
+// Add retry capability for AWS operations
+async function sendWithRetry(operation, maxRetries = 3) {
+  let lastError;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      console.log(`Operation failed, attempt ${attempt + 1}/${maxRetries}:`, error.message);
+      lastError = error;
+      
+      // If it's not a signature expiration error, don't retry
+      if (!error.message.includes('Signature expired')) {
+        throw error;
+      }
+      
+      // Wait before retrying (exponential backoff)
+      if (attempt < maxRetries - 1) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+      }
+    }
+  }
+  
+  throw lastError;
+}
+
+async function sendFollowUpEmail(transporter, email, name) {
   const mailOptions = {
     from: `"Metana Recruiting" <${process.env.SENDER_EMAIL || 'noreply@example.com'}>`,
     to: email,
@@ -86,23 +152,77 @@ async function sendFollowUpEmail(email, name) {
   return transporter.sendMail(mailOptions);
 }
 
-async function storeEmailTask(task) {
+async function storeEmailTask(dynamoDB, task) {
+  // Try multiple key formats to identify what your DynamoDB table is expecting
+  const generatedId = `email_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  
+  const itemToSave = {
+    // Try various possible key names that your table might be using
+    ID: generatedId,           // Try uppercase ID
+    id: generatedId,           // Try lowercase id
+    emailId: generatedId,      // Try emailId
+    taskId: generatedId,       // Try taskId
+    pk: generatedId,           // Try pk (common for partition key)
+    ...task
+  };
+  
+  // Log for debugging
+  console.log('Attempting to store item with multiple key formats:', JSON.stringify(itemToSave));
+  
+  // First, let's describe the table to understand its schema
+  try {
+    // This will help identify the correct key structure
+    const tableName = process.env.DYNAMODB_TABLE || 'ScheduledEmails';
+    const dynamoDBClient = new AWS.DynamoDB();
+    const tableDesc = await dynamoDBClient.describeTable({ TableName: tableName }).promise();
+    console.log('Table schema:', JSON.stringify(tableDesc));
+    
+    // Extract the primary key information
+    const keySchema = tableDesc.Table.KeySchema;
+    console.log('Table key schema:', JSON.stringify(keySchema));
+    
+    // Update the item based on the actual table schema
+    if (keySchema && keySchema.length > 0) {
+      const primaryKeyName = keySchema[0].AttributeName;
+      console.log(`Using primary key name: ${primaryKeyName}`);
+      itemToSave[primaryKeyName] = generatedId;
+    }
+  } catch (error) {
+    console.log('Could not describe table:', error.message);
+    // Continue with our best guess approach
+  }
+  
   const params = {
     TableName: process.env.DYNAMODB_TABLE || 'ScheduledEmails',
-    Item: {
-      id: `email_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
-      ...task
-    }
+    Item: itemToSave
   };
   
   await dynamoDB.put(params).promise();
-  return params.Item.id;
+  return generatedId;
 }
 
-async function updateEmailTaskStatus(taskId, status, errorMessage = null) {
+async function updateEmailTaskStatus(dynamoDB, taskId, status, errorMessage = null) {
+  // Try to determine the key name through a describe table call
+  const tableName = process.env.DYNAMODB_TABLE || 'ScheduledEmails';
+  let keyName = 'id'; // Default key name
+  
+  try {
+    const dynamoDBClient = new AWS.DynamoDB();
+    const tableDesc = await dynamoDBClient.describeTable({ TableName: tableName }).promise();
+    const keySchema = tableDesc.Table.KeySchema;
+    if (keySchema && keySchema.length > 0) {
+      keyName = keySchema[0].AttributeName;
+    }
+  } catch (error) {
+    console.log('Could not determine table key schema:', error.message);
+    // Continue with default key name
+  }
+  
+  console.log(`Updating task ${taskId} status to ${status} using key name: ${keyName}`);
+  
   const params = {
-    TableName: process.env.DYNAMODB_TABLE || 'ScheduledEmails',
-    Key: { id: taskId },
+    TableName: tableName,
+    Key: {},
     UpdateExpression: 'SET #status = :status, updatedAt = :updatedAt',
     ExpressionAttributeNames: {
       '#status': 'status'
@@ -112,6 +232,9 @@ async function updateEmailTaskStatus(taskId, status, errorMessage = null) {
       ':updatedAt': new Date().toISOString()
     }
   };
+  
+  // Set the key with the determined key name
+  params.Key[keyName] = taskId;
   
   if (errorMessage) {
     params.UpdateExpression += ', errorMessage = :errorMessage';
