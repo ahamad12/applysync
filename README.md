@@ -15,7 +15,7 @@ This project is designed to streamline the job application process by leveraging
 | **Frontend**  | React.js on Netlify  | Responsive UI with seamless CI/CD and a global CDN |
 | **Backend**   | Node.js/Express on Railway | Handles async operations, API integrations, and auto-scaling |
 | **CV Storage**| AWS S3               | Durable and cost-effective object storage |
-| **Database**  | MongoDB Atlas        | Flexible schema, automated backups, and scalability |
+| **Database**  | DynamoDB   | Flexible schema, automated backups, and scalability |
 | **CV Parsing**| AWS Lambda           | Serverless, event-driven for compute-intensive tasks |
 | **Email Scheduling** | AWS Lambda + DynamoDB | Low-latency, scalable email event tracking |
 | **Data Visualization** | Google Sheets API | Non-technical access to application data |
