@@ -107,7 +107,7 @@ exports.submitApplication = async (req, res, next) => {
         metadata: {
           applicant_name: name,
           email: email,
-          status: "testing",
+          status: "prod",
           cv_processed: true,
           processed_timestamp: new Date().toISOString()
         }
